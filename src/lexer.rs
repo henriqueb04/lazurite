@@ -42,7 +42,8 @@ pub enum TokenType {
     // Literals
     Identifier(String),
     StringLiteral(String),
-    Number(i32),
+    Integer(i32),
+    Float(f32),
 
     // keywords
     If,
@@ -91,11 +92,11 @@ const WHITESPACE_CHARS: &[char] = &[' ', '\n', '\t'];
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub token_type: TokenType,
-    pub col: u32,
+    pub col: usize,
 }
 
 impl Token {
-    pub fn new(token_type: TokenType, col: u32) -> Self {
+    pub fn new(token_type: TokenType, col: usize) -> Self {
         Token { token_type, col }
     }
 }
@@ -103,8 +104,8 @@ impl Token {
 pub struct Lexer {
     source: Vec<char>,
     tokens: Vec<Token>,
-    start: u32,
-    current: u32,
+    start: usize,
+    current: usize,
 }
 
 impl Lexer {
@@ -117,11 +118,20 @@ impl Lexer {
         }
     }
 
-    pub fn peek(&self) -> Option<&char> {
-        if self.current >= self.source.len() as u32 {
+    pub fn peek_offset(&self, offset: isize) -> Option<&char> {
+        let c = self.current as isize;
+        if c + offset >= self.source.len() as isize && c + offset < 0 {
             None
         } else {
-            Some(&self.source[self.current as usize])
+            Some(&self.source[(c + offset) as usize])
+        }
+    }
+
+    pub fn peek(&self) -> Option<&char> {
+        if self.current >= self.source.len() {
+            None
+        } else {
+            Some(&self.source[self.current])
         }
     }
 
@@ -139,9 +149,10 @@ impl Lexer {
             self.start = self.current;
             match c {
                 _ if WHITESPACE_CHARS.contains(&c) => (),
+                // Dice type
                 'd' => {
                     if let Some(&c2) = self.advance() {
-                        if !self.peek().unwrap().is_numeric() {
+                        if !c2.is_ascii_digit() {
                             if let Some(mut name) = self.read_identifier() {
                                 name.insert(0, 'd');
                                 self.add_token(TokenType::Identifier(name));
@@ -150,8 +161,8 @@ impl Lexer {
                             }
                         }
                         self.add_token(TokenType::Dice);
-                        if let Some(n) = self.read_number() {
-                            self.add_token(TokenType::Number(n));
+                        if let Some(n) = self.read_int() {
+                            self.add_token(TokenType::Integer(n));
                             if let Some(s) = self.read_identifier() {
                                 self.add_token(TokenType::DiceOption(s));
                             }
@@ -161,17 +172,37 @@ impl Lexer {
                         }
                     }
                 }
-                _ if c.is_alphabetic() || c == '_' => {
+                // Identifier or keyword
+                _ if (c.is_alphabetic() || c == '_') => {
                     if let Some(name) = self.read_identifier() {
                         self.add_token(categorize_word(name));
                         continue;
                     }
                 }
+                // Number (int or float)
                 '0'..='9' => {
-                    let num = self.read_number();
-                    if let Some(n) = num {
-                        self.add_token(TokenType::Number(n));
-                        continue;
+                    if let Some(mut num_str) = self.read_digits() {
+                        // Check if number is float
+                        if let Some(&c2) = self.peek() && c2 == '.' {
+                            if let Some(&c3) = self.peek_offset(1) && c3.is_alphabetic() {
+                                // if format is 111.a then treat dot as operator
+                                continue
+                            }
+                            // Consume .
+                            self.advance();
+                            if let Some(num_str2) = self.read_digits() {
+                                num_str.push('.');
+                                num_str.push_str(num_str2.as_str());
+                            }
+                            if let Ok(n) = num_str.parse::<f32>() {
+                                self.add_token(TokenType::Float(n));
+                                continue;
+                            }
+                        }
+                        if let Ok(n) = num_str.parse::<i32>() {
+                            self.add_token(TokenType::Integer(n));
+                            continue;
+                        }
                     }
                 }
                 '(' => {
@@ -202,7 +233,18 @@ impl Lexer {
                 '#' => self.add_token(TokenType::HashSign),
                 ',' => self.add_token(TokenType::Comma),
                 ';' => self.add_token(TokenType::Semicolon),
-                '.' => self.add_ambiguous_token('.', TokenType::Dot, TokenType::DotDot),
+                '.' => {
+                    // if .111 format, treat as float
+                    if self.advance().is_some() && let Some(mut num_str) = self.read_digits() {
+                        num_str.insert_str(0, "0.");
+                        if let Ok(n) = num_str.parse::<f32>() {
+                            self.add_token(TokenType::Float(n));
+                        }
+                        continue
+                    }
+                    self.add_token(TokenType::Dot);
+                    continue;
+                },
                 '=' => self.add_ambiguous_token('=', TokenType::Equal, TokenType::EqualEqual),
                 '>' => self.add_ambiguous_token('=', TokenType::Greater, TokenType::GreaterEqual),
                 '<' => self.add_ambiguous_token('=', TokenType::Less, TokenType::LessEqual),
@@ -229,8 +271,7 @@ impl Lexer {
     }
 
     fn read_identifier(&mut self) -> Option<String> {
-        let c = self.peek();
-        if c.is_some() && c.unwrap().is_alphabetic() {
+        if let Some(&c) = self.peek() && (c.is_alphabetic() || c == '_') {
             self.read_alphanum()
         } else {
             None
@@ -240,7 +281,7 @@ impl Lexer {
     fn read_alphanum(&mut self) -> Option<String> {
         let mut name = String::new();
         while let Some(&c) = self.peek() {
-            if !c.is_alphanumeric() {
+            if !(c.is_alphanumeric() || c == '_') {
                 break;
             }
             name.push(c);
@@ -285,15 +326,24 @@ impl Lexer {
         self.add_token(t);
     }
 
-    fn read_number(&mut self) -> Option<i32> {
+    fn read_digits(&mut self) -> Option<String> {
         let mut num = String::new();
         while let Some(&c) = self.peek() {
-            if !c.is_numeric() {
+            if !c.is_ascii_digit() {
                 break;
             }
             num.push(c);
             self.advance();
         }
-        num.parse().ok()
+        if num.is_empty() {
+            None
+        } else {
+            Some(num)
+        }
+    }
+
+    fn read_int(&mut self) -> Option<i32> {
+        let num_str = self.read_digits()?;
+        num_str.parse::<i32>().ok()
     }
 }
